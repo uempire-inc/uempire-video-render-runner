@@ -37,12 +37,16 @@ PATTERN = re.compile(r"[A-Za-z0-9_.*?\[\]-]{1,64}")
 
 # Paths (relative to the studio folder) the host may READ (pull) and WRITE (push). Writes are bound to one deliverable.
 READ_ALLOW = re.compile(r"(01_PROJECT_CONTROL/(jobs|render-ledger)|05_WORK_IN_PROGRESS|06_FINAL_EXPORTS/2026/V\d{3}_[^/]+/(AUDIO|QA))(/.*)?")
-WRITE_ALLOW = (
-    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/(MASTER|REEL|AUDIO|QA|THUMBNAILS|MANIFEST|SUBTITLES)/[^/]+",
+WRITE_ALLOW = (   # bound to ONE deliverable: {v}=V00X, {k}=MASTER|REEL (a reel job can never touch master files)
+    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/{k}/[^/]*-{k}-[^/]+",
+    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/(QA|THUMBNAILS|MANIFEST|SUBTITLES)/[^/]*-{k}-[^/]+",
+    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/AUDIO/[^/]+",
     r"04_AUDIO/{v}_[^/]+/[^/]+",
-    r"05_WORK_IN_PROGRESS/V5_QA_FAIL/{v}_[^/]+/[^/]+",
+    r"05_WORK_IN_PROGRESS/V5_QA_FAIL/{v}_[^/]+/[^/]*-{k}-[^/]+",
     r"01_PROJECT_CONTROL/render-ledger/{cid}\.jsonl",      # the worker's own log; .final.json is written by finalize only
 )
+# Shared inputs (approved narration, music, SFX) are create-only: an existing Drive file is never replaced by a job.
+CREATE_ONLY = re.compile(r"(06_FINAL_EXPORTS/2026/V\d{3}_[^/]+/AUDIO|04_AUDIO/V\d{3}_[^/]+)/[^/]+")
 PLAN_WRITE = re.compile(r"01_PROJECT_CONTROL/render-ledger/V5-V00[1-6]-(master|reel)\.final\.json")
 LOGS_ROOT = "01_PROJECT_CONTROL/render-logs"
 SELFTEST = "01_PROJECT_CONTROL/_selftest"                # the ONLY place anything may ever be deleted
@@ -81,8 +85,9 @@ def need_path(rel):
 def write_allowed(rel, scope):
     if scope == "plan":
         return bool(PLAN_WRITE.fullmatch(rel))
-    v = scope.split("-")[1]
-    return any(re.fullmatch(p.format(v=v, cid=re.escape(scope)), rel) for p in WRITE_ALLOW)
+    _, v, kind = scope.split("-")
+    k = kind.upper()
+    return any(re.fullmatch(p.format(v=v, k=k, cid=re.escape(scope)), rel) for p in WRITE_ALLOW)
 
 
 def now():
@@ -565,6 +570,8 @@ def cmd_push(stage, manifest_path, scope, report_path):
                         rec = None
                     if not isinstance(rec, dict) or rec.get("FINAL_READY") is not False or rec.get("STATUS") != "WAITING_FOR_CAPTURE":
                         log("reject a plan ledger record"); report["all_verified"] = False; continue
+                if CREATE_ONLY.fullmatch(rel) and lookup(rel):
+                    log("kept an existing shared input (create-only)"); continue
                 meta = upload(f, rel)
             report["uploads"][rel] = "verified" if meta else "FAILED"
             report["all_verified"] &= bool(meta)

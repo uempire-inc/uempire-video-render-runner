@@ -242,7 +242,7 @@ chk('upload(f, f"01_PROJECT_CONTROL/render-ledger/{cid}.final.json")' in seg("cm
     and set(re.findall(r'probe\(f"([^{]*\{[A-Z_]*)', seg("cmd_selftest"))) == {"{SELFTEST", "06_FINAL_EXPORTS/2026/{"} and "/QA/_selftest-{tag}/" in seg("cmd_selftest"),
     "finalize / logs / selftest upload only to ledger / render-logs / the self-test sandboxes")
 allow = re.search(r"WRITE_ALLOW = \((.*?)\n\)", src, re.S)
-prefixes = sorted(re.findall(r'r"([^{(\\"]+)', allow.group(1))) if allow else []
+prefixes = sorted(set(re.findall(r'r"([^{(\\"]+)', allow.group(1)))) if allow else []
 chk(prefixes == ["01_PROJECT_CONTROL/render-ledger/", "04_AUDIO/", "05_WORK_IN_PROGRESS/V5_QA_FAIL/", "06_FINAL_EXPORTS/2026/"],
     "write allowlist prefixes are exactly the owner's (final exports, 04_AUDIO, QA_FAIL, render-ledger)")
 chk('FETCH_HOST, FETCH_PREFIX = "storage.googleapis.com", "/xi-backend/"' in src and "u.netloc != FETCH_HOST" in seg("cmd_fetch"), "fetch is limited to https://storage.googleapis.com/xi-backend/")
@@ -257,6 +257,12 @@ if [ "${CHECK_REMOTE:-}" ]; then
     && ok "remote $CHECK_REMOTE is empty (0 commits)" || fail "remote $CHECK_REMOTE is not empty"
   n=$(gh secret list --repo "$CHECK_REMOTE" 2>/dev/null | wc -l | tr -d ' '); echo "      remote secrets configured: $n"
 fi
+
+echo "== 7. Deliverable-scoped writes"
+grep -q '{v}_\[^/\]+/{k}/\[^/\]\*-{k}-' bootstrap/drive.py && grep -q 'kind.upper()' bootstrap/drive.py \
+  && ok "writes bound to one deliverable (video + MASTER|REEL kind)" || fail "write allowlist not bound to deliverable kind"
+grep -q '^CREATE_ONLY = ' bootstrap/drive.py && grep -q 'CREATE_ONLY.fullmatch(rel) and lookup(rel)' bootstrap/drive.py \
+  && ok "shared audio inputs are create-only" || fail "shared audio inputs can be overwritten"
 
 echo
 [ $FAIL -eq 0 ] && echo "FINAL_SECURITY_VERDICT=PASS" || echo "FINAL_SECURITY_VERDICT=FAIL"
