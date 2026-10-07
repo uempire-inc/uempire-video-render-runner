@@ -1,0 +1,11 @@
+# Deny by default; only the files below are tracked.
+*
+!.gitignore
+!README.md
+!.github/
+!.github/workflows/
+!.github/workflows/render.yml
+!bootstrap/
+!bootstrap/run.sh
+!scripts/
+!scripts/public-safety-audit.sh

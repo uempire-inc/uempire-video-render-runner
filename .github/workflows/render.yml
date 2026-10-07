@@ -1,0 +1,107 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      deliverables:
+        description: "all, or comma-separated deliverable ids"
+        default: V5-V003-reel
+        required: true
+      job:
+        description: "job file name"
+        default: latest.json
+      force:
+        description: "1 = re-render even if already final"
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency: render
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    env:
+      SELECTION: ${{ inputs.deliverables }}
+      V5_JOB: ${{ inputs.job }}
+      V5_FORCE: ${{ inputs.force }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - name: Packages
+        run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rclone > /dev/null
+      - name: Fetch private bundle
+        env: &drive
+          DRIVE_BUNDLE_PATH: ${{ secrets.DRIVE_BUNDLE_PATH }}
+          DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
+          RCLONE_CONFIG_GD_TYPE: drive
+          RCLONE_CONFIG_GD_SCOPE: drive
+          RCLONE_CONFIG_GD_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          RCLONE_CONFIG_GD_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          RCLONE_CONFIG_GD_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.GOOGLE_REFRESH_TOKEN }}","expiry":"2000-01-01T00:00:00Z"}'
+        run: bootstrap/run.sh fetch "$SELECTION"
+      - name: Plan
+        id: plan
+        env: *drive
+        run: bootstrap/run.sh plan "$SELECTION"
+      - name: Cleanup
+        if: always()
+        env: *drive
+        run: bootstrap/run.sh cleanup plan
+
+  render:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false   # one failed deliverable never cancels the others
+      max-parallel: 2
+      matrix:
+        deliverable: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      DELIVERABLE: ${{ matrix.deliverable }}
+      V5_JOB: ${{ inputs.job }}
+      V5_FORCE: ${{ inputs.force }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: 20
+      - name: Packages
+        run: |
+          sudo apt-get update -qq > /dev/null
+          sudo apt-get install -y -qq ffmpeg rsync fuse3 rclone libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm1 \
+            libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 libxdamage1 libpango-1.0-0 libcairo2 libcups2 \
+            fonts-noto-color-emoji "$(apt-cache show libasound2t64 > /dev/null 2>&1 && echo libasound2t64 || echo libasound2)" > /dev/null
+      - name: Fetch private bundle
+        env: &drive_r
+          DRIVE_BUNDLE_PATH: ${{ secrets.DRIVE_BUNDLE_PATH }}
+          DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
+          RCLONE_CONFIG_GD_TYPE: drive
+          RCLONE_CONFIG_GD_SCOPE: drive
+          RCLONE_CONFIG_GD_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          RCLONE_CONFIG_GD_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          RCLONE_CONFIG_GD_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.GOOGLE_REFRESH_TOKEN }}","expiry":"2000-01-01T00:00:00Z"}'
+        run: bootstrap/run.sh fetch "$DELIVERABLE"
+      - name: Install dependencies (no secrets)
+        run: bootstrap/run.sh install "$DELIVERABLE"
+      - name: Mount Drive
+        env: *drive_r
+        run: bootstrap/run.sh mount "$DELIVERABLE"
+      - name: Render (no secrets)
+        run: bootstrap/run.sh render "$DELIVERABLE"
+      - name: Verify on Drive
+        env: *drive_r
+        run: bootstrap/run.sh finalize "$DELIVERABLE"
+      - name: Cleanup
+        if: always()
+        env: *drive_r
+        run: bootstrap/run.sh cleanup "$DELIVERABLE"
