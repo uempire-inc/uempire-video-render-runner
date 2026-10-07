@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render bootstrap. Host side = audited generic operations only (bootstrap/drive.py holds the Google credential);
 # every line of bundle / npm / Remotion / Chrome / FFmpeg code runs inside the hardened container (box), never here.
-#   bootstrap/run.sh <fetch|image|install|inputs|pull|render|upload|plan-pull|plan|plan-publish|selftest|cleanup> [arg]
+#   bootstrap/run.sh <fetch|image|install|inputs|pull|render|upload|plan-pull|plan|plan-publish|selftest|revoke|cleanup> [arg]
 set -euo pipefail
 umask 077
 : "${RUNNER_TEMP:?}"
@@ -14,7 +14,7 @@ JOBS=01_PROJECT_CONTROL/jobs
 # Dispatch inputs are strictly validated (allowlisted characters, no path traversal, known deliverable ids only).
 ARG=${2:-all}
 [[ "$ARG" =~ ^[A-Za-z0-9._,-]{1,400}$ && "$ARG" != *..* ]] || { echo "input FAIL (invalid deliverable)"; exit 2; }
-[[ "$ARG" =~ ^(all|plan|selftest|V5-V00[1-6]-(master|reel)(,V5-V00[1-6]-(master|reel))*)$ ]] || { echo "input FAIL (unknown deliverable)"; exit 2; }
+[[ "$ARG" =~ ^(all|plan|selftest|revoke|V5-V00[1-6]-(master|reel)(,V5-V00[1-6]-(master|reel))*)$ ]] || { echo "input FAIL (unknown deliverable)"; exit 2; }
 [[ "${V5_JOB:-latest.json}" =~ ^[A-Za-z0-9_-]{1,80}\.json$ ]] || { echo "input FAIL (invalid job name)"; exit 2; }
 [[ "${V5_FORCE:-0}" =~ ^[01]$ ]] || { echo "input FAIL (invalid force flag)"; exit 2; }
 V5_JOB=${V5_JOB:-latest.json}; V5_FORCE=${V5_FORCE:-0}
@@ -128,6 +128,11 @@ PY
   selftest)  # host only, no container: proves the Drive boundary; one PASS/FAIL line per check, counts only
     [ "$ARG" = selftest ] || { echo "input FAIL (selftest expected)"; exit 2; }
     "${DRIVE[@]}" selftest "${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" 2>> "$LOGS/selftest.log"
+    ;;
+  revoke)   # host only, end of production: revoke the Google grant, then prove the credential is dead
+    [ "$ARG" = revoke ] || { echo "input FAIL (revoke expected)"; exit 2; }
+    "${DRIVE[@]}" revoke 2>> "$LOGS/revoke.log"
+    rm -f "$LOGS/revoke.log"   # nothing to archive: the credential that would upload it no longer exists
     ;;
   cleanup)
     docker ps -q | xargs -r docker kill > /dev/null 2>&1 || true

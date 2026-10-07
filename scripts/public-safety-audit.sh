@@ -21,7 +21,7 @@ SECRETS='-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ya
 DRIVE_ID='(^|[^A-Za-z0-9_-])1[A-Za-z0-9_-]{32}([^A-Za-z0-9_-]|$)'
 
 scan() {  # scan <label> <content-stream on stdin>
-  local label=$1 data; data=$(sed -E 's/[A-Za-z0-9._+-]+@users\.noreply\.github\.com//g; s/noreply@anthropic\.com//g')  # public no-reply addresses are fine
+  local label=$1 data; data=$(sed -E 's/[A-Za-z0-9._+-]+@users\.noreply\.github\.com//g; s/noreply@anthropic\.com//g; s/[A-Za-z0-9._+-]+@[Ee]xample\.com//g')  # public no-reply + RFC 2606 example addresses are fine
   if grep -Eq -- "$SECRETS" <<<"$data"; then fail "$label: secret-like pattern: $(grep -Eo -- "$SECRETS" <<<"$data" | head -3 | sed 's/\(.\{6\}\).*/\1…/' | tr '\n' ' ')"; fi
   if grep -Eq -- "$DRIVE_ID" <<<"$data"; then fail "$label: Google Drive file id pattern"; fi
   if [ -n "$PRIVATE_PATTERNS" ]; then
@@ -104,7 +104,8 @@ chk(wf.get("permissions") == {"contents": "read"}, "workflow token: exactly cont
 SECRET = re.compile(r"\$\{\{\s*(secrets|vars)\.")
 chk(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", src)) <= {"GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "DRIVE_BUNDLE_SHA256"},
     "only the OAuth client/refresh-token secrets and DRIVE_BUNDLE_SHA256 are secrets")
-chk(set(re.findall(r"vars\.([A-Za-z0-9_]+)", src)) <= {"DRIVE_STUDIO_FOLDER_ID", "DRIVE_FINAL_FOLDER_ID", "DRIVE_BUNDLE_PATH"}, "only DRIVE_STUDIO_FOLDER_ID / DRIVE_FINAL_FOLDER_ID / DRIVE_BUNDLE_PATH are variables")
+chk(set(re.findall(r"vars\.([A-Za-z0-9_]+)", src)) <= {"DRIVE_STUDIO_FOLDER_ID", "DRIVE_FINAL_FOLDER_ID", "DRIVE_BUNDLE_PATH", "DRIVE_ACCOUNT_EMAIL"},
+    "only DRIVE_STUDIO_FOLDER_ID / DRIVE_FINAL_FOLDER_ID / DRIVE_BUNDLE_PATH / DRIVE_ACCOUNT_EMAIL are variables")
 chk(not SECRET.search(dump(wf.get("env", {}))), "no secrets in workflow-level env")
 ALLOWED_ACTIONS = {"actions/checkout"}   # no third-party (auth) action: the OIDC exchange is bootstrap/drive.py
 for jname, job in wf["jobs"].items():
@@ -125,8 +126,9 @@ for jname, job in wf["jobs"].items():
         if re.search(r"run\.sh (image|install|inputs|render|plan)( |$)", run) or re.search(r"apt-get|docker|npm|npx|node|ffmpeg|pip", run):
             chk(not has_secret, f"{jname}/{name}: sandbox/third-party step runs without secrets or variables")
         if has_secret:
-            chk(re.fullmatch(r"bootstrap/run\.sh (fetch|plan-pull|plan-publish|pull|upload|selftest|cleanup) \"?\$[A-Z_]+\"?|bootstrap/run\.sh cleanup plan", run.strip()) is not None,
-                f"{jname}/{name}: credentials only reach the host steps fetch/plan-pull/plan-publish/pull/upload/selftest/cleanup")
+            host_mode = run.strip() == 'bootstrap/run.sh "$SELECTION" "$SELECTION"' and job.get("if") == "inputs.deliverables == 'selftest' || inputs.deliverables == 'revoke'"
+            chk(host_mode or re.fullmatch(r"bootstrap/run\.sh (fetch|plan-pull|plan-publish|pull|upload|selftest|cleanup) \"?\$[A-Z_]+\"?|bootstrap/run\.sh cleanup plan", run.strip()) is not None,
+                f"{jname}/{name}: credentials only reach the host steps fetch/plan-pull/plan-publish/pull/upload/selftest/revoke/cleanup")
         chk(not re.search(r"ACTIONS_ID_TOKEN|GITHUB_TOKEN|github\.token", dump(st)), f"{jname}/{name}: no OIDC/GitHub token handed to a step")
     cleanup = [s for s in steps if "cleanup" in s.get("run", "")]
     chk(bool(cleanup) and cleanup[-1].get("if") == "always()" and steps[-1] is cleanup[-1], f"{jname}: final cleanup step with if: always()")
@@ -269,8 +271,16 @@ chk("deletable(" in d and d.index("deletable(") < d.index('"DELETE"') and d.inde
     and 'SELFTEST = "01_PROJECT_CONTROL/_selftest"' in src and 'SELFTEST_DIR = re.compile(r"_selftest-' in src,
     "delete guarded by the recorded top-down path: only <studio>/01_PROJECT_CONTROL/_selftest/** or <final>/V003_*/QA/_selftest-<run>/**")
 # uploads
-chk(callers("upload") <= {"cmd_push", "cmd_finalize", "cmd_logs", "cmd_selftest", "probes"} and {"cmd_push", "cmd_finalize", "cmd_logs"} <= callers("upload"),
-    "uploads only from push / finalize / logs / selftest")
+chk(callers("upload") <= {"cmd_push", "cmd_finalize", "write_manifest", "cmd_logs", "cmd_selftest", "probes"} and {"cmd_push", "cmd_finalize", "cmd_logs"} <= callers("upload")
+    and callers("write_manifest") == {"cmd_finalize"} and 'upload(fh, f"{folder}/MANIFEST/{stem}-FINAL-MANIFEST.json")' in seg("write_manifest"),
+    "uploads only from push / finalize (+ its per-output manifest in <V00X>/MANIFEST) / logs / selftest")
+a = auth
+chk("self._account(token)" in a and a.index("self._account(token)") < a.index("self.token, self.expires = token, expires")
+    and 'env("DRIVE_ACCOUNT_EMAIL", EMAIL)' in a and "hmac.compare_digest" in a and 'die("refused: the credential belongs to another Google account")' in a,
+    "every fresh access token is checked against DRIVE_ACCOUNT_EMAIL before it can be used")
+chk('REVOKE_URL = "https://oauth2.googleapis.com/revoke"' in src and "REVOKE_URL" in a and src.count(".revoke(") == 1 and "AUTH.revoke()" in seg("cmd_revoke")
+    and all(f'check("A0-{c}' in seg("cmd_selftest_offline") for c in ("expected-account-accepted", "other-account-refused", "empty-account-refused")),
+    "revoke command present; offline tests prove the account enforcement")
 push = seg("cmd_push")
 chk("write_allowed(" in push and push.index("write_allowed(") < push.index("upload("), "push checks every destination against the write allowlist before upload")
 chk('upload(f, f"01_PROJECT_CONTROL/render-ledger/{cid}.final.json")' in seg("cmd_finalize") and "LOGS_ROOT" in seg("cmd_logs")
@@ -299,7 +309,7 @@ if [ "${CHECK_REMOTE:-}" ]; then
 fi
 
 echo "== 7. Deliverable-scoped writes"
-grep -q '{v}_\[^/\]+/{k}/\[^/\]\*-{k}-' bootstrap/drive.py && grep -q 'kind.upper()' bootstrap/drive.py \
+grep -q '{v}_\[^/\]+/{k}/\[^/\]\*\[-_\]{k}\[-_\]' bootstrap/drive.py && grep -q 'kind.upper()' bootstrap/drive.py \
   && ok "writes bound to one deliverable (video + MASTER|REEL kind)" || fail "write allowlist not bound to deliverable kind"
 grep -q '^CREATE_ONLY = ' bootstrap/drive.py && grep -q 'CREATE_ONLY.fullmatch(rel) and lookup(rel)' bootstrap/drive.py \
   && ok "shared audio inputs are create-only" || fail "shared audio inputs can be overwritten"

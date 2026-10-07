@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       deliverables:
-        description: "all, comma-separated deliverable ids, or selftest"
+        description: "all, comma-separated deliverable ids, selftest, or revoke (end of production)"
         default: V5-V003-reel
         required: true
       job:
@@ -22,8 +22,8 @@ permissions:
 concurrency: render
 
 jobs:
-  selftest:   # host only, no container: proves what the renderer account can and cannot reach
-    if: inputs.deliverables == 'selftest'
+  selftest:   # host only, no container: boundary self-test, or the end-of-production credential revocation
+    if: inputs.deliverables == 'selftest' || inputs.deliverables == 'revoke'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -32,23 +32,24 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
-      - name: Drive boundary self-test (host)
+      - name: Drive boundary self-test or revoke (host)
         env: &gd_s
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_ACCOUNT_EMAIL: ${{ vars.DRIVE_ACCOUNT_EMAIL }}
           DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
           DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
           DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}
           DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
-        run: bootstrap/run.sh selftest "$SELECTION"
+        run: bootstrap/run.sh "$SELECTION" "$SELECTION"
       - name: Cleanup
         if: always()
         env: *gd_s
         run: bootstrap/run.sh cleanup "$SELECTION"
 
   plan:
-    if: inputs.deliverables != 'selftest'
+    if: inputs.deliverables != 'selftest' && inputs.deliverables != 'revoke'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -66,6 +67,7 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_ACCOUNT_EMAIL: ${{ vars.DRIVE_ACCOUNT_EMAIL }}
           DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
           DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
           DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}
@@ -110,6 +112,7 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_ACCOUNT_EMAIL: ${{ vars.DRIVE_ACCOUNT_EMAIL }}
           DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
           DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
           DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}

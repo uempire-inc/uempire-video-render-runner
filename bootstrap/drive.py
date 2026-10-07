@@ -25,9 +25,11 @@ folder $DRIVE_STUDIO_FOLDER_ID and the final output root $DRIVE_FINAL_FOLDER_ID.
   drive.py finalize <stage> <result.json> <deliverable> <start> <report>   FINAL ledger record (exit 1 unless ready)
   drive.py logs <dir> <run-name>                       upload the private logs
   drive.py selftest <run-name>                         boundary self-test A-K ('<check> PASS|FAIL' only)
-  drive.py selftest-offline                            checks I-K with no credential and no network (tripwire)
+  drive.py selftest-offline                            checks I-K + account enforcement, no credential and no network (tripwire)
+  drive.py revoke                                      end of production: revoke the refresh token, prove it is dead
 
-Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, DRIVE_STUDIO_FOLDER_ID, DRIVE_FINAL_FOLDER_ID
+Account: every fresh access token is checked against $DRIVE_ACCOUNT_EMAIL (Drive 'about') before any use; mismatch -> exit.
+Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, DRIVE_ACCOUNT_EMAIL, DRIVE_STUDIO_FOLDER_ID, DRIVE_FINAL_FOLDER_ID
 (+ DRIVE_BUNDLE_PATH, DRIVE_BUNDLE_SHA256 for bundle). Output: no credential, URL, file id, file name or configuration
 value is ever printed; progress goes to stderr (private log). Container outputs (spec, result, staged files) are
 untrusted data: validated, never executed, symlinks never followed.
@@ -37,6 +39,9 @@ import contextlib, datetime, fnmatch, hashlib, hmac, io, json, os, re, secrets, 
 DRIVE_API = "https://www.googleapis.com/drive/v3/files"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+ABOUT_API = "https://www.googleapis.com/drive/v3/about"
+EMAIL = r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}"
 FOLDER = "application/vnd.google-apps.folder"
 CHUNK = 32 << 20                     # resumable upload chunk (multiple of 256 KiB)
 DELIVERABLE = re.compile(r"V5-V00[1-6]-(master|reel)")
@@ -47,11 +52,11 @@ PATTERN = re.compile(r"[A-Za-z0-9_.*?\[\]-]{1,64}")
 # Paths (relative to the studio folder) the host may READ (pull) and WRITE (push). Writes are bound to one deliverable.
 READ_ALLOW = re.compile(r"(01_PROJECT_CONTROL/(jobs|render-ledger)|05_WORK_IN_PROGRESS|06_FINAL_EXPORTS/2026/V\d{3}_[^/]+/(AUDIO|QA))(/.*)?")
 WRITE_ALLOW = (   # bound to ONE deliverable: {v}=V00X, {k}=MASTER|REEL (a reel job can never touch master files)
-    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/{k}/[^/]*-{k}-[^/]+",
-    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/(QA|THUMBNAILS|MANIFEST|SUBTITLES)/[^/]*-{k}-[^/]+",
+    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/{k}/[^/]*[-_]{k}[-_][^/]+",
+    r"06_FINAL_EXPORTS/2026/{v}_[^/]+/(QA|THUMBNAILS|MANIFEST|SUBTITLES)/[^/]*[-_]{k}[-_][^/]+",
     r"06_FINAL_EXPORTS/2026/{v}_[^/]+/AUDIO/[^/]+",
     r"04_AUDIO/{v}_[^/]+/[^/]+",
-    r"05_WORK_IN_PROGRESS/V5_QA_FAIL/{v}_[^/]+/[^/]*-{k}-[^/]+",
+    r"05_WORK_IN_PROGRESS/V5_QA_FAIL/{v}_[^/]+/[^/]*[-_]{k}[-_][^/]+",
     r"01_PROJECT_CONTROL/render-ledger/{cid}\.jsonl",      # the worker's own log; .final.json is written by finalize only
 )
 # Shared inputs (approved narration, music, SFX) are create-only: an existing Drive file is never replaced by a job.
@@ -127,23 +132,61 @@ class Auth:
 
     def get(self, renew=False):
         if renew or not self.token or time.time() > self.expires - 300:
-            self.token, self.expires = self._exchange()
+            self.token = None
+            token, expires = self._exchange()
+            self._account(token)          # every fresh access token must belong to $DRIVE_ACCOUNT_EMAIL, else die
+            self.token, self.expires = token, expires
         return self.token
 
     @staticmethod
-    def _exchange():
-        form = urllib.parse.urlencode({
+    def _form():
+        return urllib.parse.urlencode({
             "client_id": env("GOOGLE_CLIENT_ID", r"[0-9]{6,30}-[a-z0-9]{10,64}\.apps\.googleusercontent\.com"),
             "client_secret": env("GOOGLE_CLIENT_SECRET", r"[A-Za-z0-9_-]{10,128}"),
             "refresh_token": env("GOOGLE_REFRESH_TOKEN", r"[A-Za-z0-9_./-]{20,1024}"),
             "grant_type": "refresh_token"}).encode()
+
+    @staticmethod
+    def _exchange():
         try:
-            r = _json(_req("POST", TOKEN_URL, form, {"Content-Type": "application/x-www-form-urlencoded"}))
+            r = _json(_req("POST", TOKEN_URL, Auth._form(), {"Content-Type": "application/x-www-form-urlencoded"}))
             return r["access_token"], time.time() + min(int(r.get("expires_in", 3600)), 3600)
         except urllib.error.HTTPError as e:
             die(f"credential exchange refused (HTTP {e.code})")
         except (urllib.error.URLError, KeyError, ValueError):
             die("credential exchange failed")
+
+    @staticmethod
+    def _account(token):
+        """The credential must be the expected Google account (Drive 'about', fixed fields, no file id)."""
+        want = env("DRIVE_ACCOUNT_EMAIL", EMAIL).lower()
+        JOURNAL.append(("GET", "about", True))
+        try:
+            r = _json(_req("GET", ABOUT_API + "?fields=user(emailAddress)", headers={"Authorization": "Bearer " + token}, timeout=60))
+            got = str((r.get("user") or {}).get("emailAddress", "")).lower()
+        except (urllib.error.URLError, ValueError, AttributeError):
+            die("account check failed")
+        if not hmac.compare_digest(got.encode(), want.encode()):
+            die("refused: the credential belongs to another Google account")
+
+    @staticmethod
+    def revoke():
+        """End of production: revoke the grant, then prove the refresh token no longer exchanges -> (revoked, refused)."""
+        ct = {"Content-Type": "application/x-www-form-urlencoded"}
+        tok = urllib.parse.urlencode({"token": env("GOOGLE_REFRESH_TOKEN", r"[A-Za-z0-9_./-]{20,1024}")}).encode()
+        try:
+            _req("POST", REVOKE_URL, tok, ct, timeout=60).close(); revoked = True
+        except urllib.error.HTTPError as e:
+            e.close(); revoked = e.code == 400      # already revoked / invalid
+        except urllib.error.URLError:
+            revoked = False
+        try:
+            _req("POST", TOKEN_URL, Auth._form(), ct, timeout=60).close(); refused = False
+        except urllib.error.HTTPError as e:
+            e.close(); refused = e.code in (400, 401)
+        except urllib.error.URLError:
+            refused = False
+        return revoked, refused
 
 
 AUTH = Auth()
@@ -224,7 +267,7 @@ FINAL = None                         # DRIVE_FINAL_FOLDER_ID  (<V00X_*>/{MASTER,
 FINAL_SUBS = ("MASTER", "REEL", "QA", "SUBTITLES", "THUMBNAILS", "MANIFEST")
 FINAL_ROUTE = re.compile(r"06_FINAL_EXPORTS/2026/(V\d{3})_[^/]+/(MASTER|REEL|QA|SUBTITLES|THUMBNAILS|MANIFEST)(?:/(.+))?")
 SELFTEST_DIR = re.compile(r"_selftest-[A-Za-z0-9-]{1,80}")   # disposable folder under <final>/V003_*/QA only
-FIELDS = "id,name,mimeType,md5Checksum,size,modifiedTime,trashed,webViewLink"
+FIELDS = "id,name,mimeType,md5Checksum,sha256Checksum,size,modifiedTime,trashed,webViewLink"
 KNOWN, VIA = {}, {}                  # id -> root id; id -> names from that root (the top-down path that reached it)
 
 
@@ -419,6 +462,7 @@ def upload(src, rel):
         die("refused: upload outside the allowlisted prefixes")
     size = os.fstat(src.fileno()).st_size
     md5 = digest(src); src.seek(0)
+    sha = digest(src, "sha256"); src.seek(0)
     root = route(rel)[0]
     parent_rel, name = rel.rsplit("/", 1)
     parent = lookup(parent_rel, create=True)
@@ -473,7 +517,12 @@ def upload(src, rel):
         register(result["id"], parent["id"], name)       # created under a KNOWN parent
     fid = (result or {}).get("id") or (lookup(rel) or {}).get("id")
     meta = file_meta(fid) if fid else None
-    ok = bool(meta) and meta.get("md5Checksum") == md5 and int(meta.get("size", -1)) == size
+    for _ in range(5):                                     # Drive may publish sha256Checksum a moment after md5
+        if not meta or meta.get("sha256Checksum"):
+            break
+        time.sleep(3); meta = file_meta(fid)
+    ok = (bool(meta) and meta.get("md5Checksum") == md5 and meta.get("sha256Checksum") == sha
+          and int(meta.get("size", -1)) == size)
     return meta if ok else None
 
 
@@ -650,15 +699,20 @@ def cmd_finalize(stage, result_path, cid, start, report_path):
         meta = lookup(mp4) if valid_path(mp4) and mp4_re.fullmatch(mp4) else None
         meta = file_meta(meta["id"]) if meta else None
         ok = (bool(meta) and q.get("status") == "PASS" and q.get("file") == mp4.rsplit("/", 1)[1]
-              and meta.get("md5Checksum") == q.get("md5") and int(meta.get("size", -1)) == q.get("size_bytes")
-              and report["uploads"].get(mp4, "verified") == "verified")
+              and meta.get("md5Checksum") == q.get("md5") and meta.get("sha256Checksum") == q.get("sha256")
+              and int(meta.get("size", -1)) == q.get("size_bytes") and report["uploads"].get(mp4, "verified") == "verified")
         files.append({"FILE": mp4.rsplit("/", 1)[1] if isinstance(mp4, str) else None, "PATH": mp4 if meta else None,
                       "QA_STATUS": q.get("status", "MISSING"), "DRIVE_ID": meta["id"] if meta else None,
                       "DRIVE_URL": meta.get("webViewLink") if meta else None,
                       "SIZE": int(meta["size"]) if meta else None,
-                      "CHECKSUM": {"md5": meta.get("md5Checksum") if meta else None, "sha256": q.get("sha256")},
-                      "VERIFIED": ok})
+                      "CHECKSUM": {"md5": meta.get("md5Checksum") if meta else None, "sha256": meta.get("sha256Checksum") if meta else None},
+                      "VERIFIED": ok, "_qa": q})
     ready = (len(files) == (1 if kind == "master" else 2) and all(f["VERIFIED"] for f in files) and report.get("all_verified") is True)
+    for f in files:                              # one manifest per verified output, next to it in <V00X>/MANIFEST
+        q = f.pop("_qa")
+        if f["VERIFIED"]:
+            ok_manifest = write_manifest(stage, report_path, cid, video, kind, f, q, ready)
+            ready &= ok_manifest
     rec = {"VIDEO": video, "TYPE": kind.upper(), "COMPOSITION": cid, "START": start, "END": now(), "RENDER_SECONDS": secs,
            "QA_STATUS": "PASS" if files and all(f["QA_STATUS"] == "PASS" for f in files) else "FAIL",
            "DRIVE_ID": [f["DRIVE_ID"] for f in files], "DRIVE_URL": [f["DRIVE_URL"] for f in files], "CHECKSUM": [f["CHECKSUM"] for f in files], "OUTPUTS": files,
@@ -671,6 +725,30 @@ def cmd_finalize(stage, result_path, cid, start, report_path):
             die("ledger upload did not verify")
     log(f"FINAL_READY={ready}")
     sys.exit(0 if ready else 1)
+
+
+def write_manifest(stage, report_path, cid, video, kind, f, q, ready):
+    """Final manifest: technical values from the container QA (typed, re-validated), Drive facts from the host."""
+    val = lambda k, t: (lambda v: v if isinstance(v, t) and not isinstance(v, bool) else None)(((q.get("checks") or {}).get(k) or {}).get("value"))
+    stem = f["FILE"][:-4]
+    folder = f["PATH"].rsplit("/", 2)[0]
+    spec = (load_json(local_path(stage, f"{folder}/MANIFEST/{stem}-MANIFEST.json")) or {}).get("render") or {}
+    ref = lambda v: v if isinstance(v, (str, dict, list)) and len(json.dumps(v)) < 4096 else None
+    m = {"video_id": video, "composition_id": cid, "type": kind.upper(), "file": f["FILE"], "render_timestamp_utc": now(),
+         "duration_s": val("duration_s", (int, float)), "width": val("width", int), "height": val("height", int), "fps": val("fps", (int, float)),
+         "video_codec": val("video_codec", str), "audio_codec": val("audio_codec", str), "audio_loudness_lufs": val("integrated_lufs", (int, float)),
+         "true_peak_dbtp": val("true_peak_dbtp", (int, float)), "file_size": f["SIZE"], "sha256": f["CHECKSUM"]["sha256"], "md5": f["CHECKSUM"]["md5"],
+         "drive_file_id": f["DRIVE_ID"], "drive_url": f["DRIVE_URL"], "drive_destination": "FINAL_ROOT/" + "/".join(f["PATH"].split("/")[2:4]),
+         "narration_reference": ref((spec.get("stems") or {}).get("vo")), "music_reference": ref((spec.get("stems") or {}).get("music")),
+         "audio_sources": ref([{k: a.get(k) for k in ("dest_name", "generation_id", "kind") if isinstance(a, dict)} for a in spec.get("audio") or []][:40]),
+         "subtitle_reference": ref(spec.get("subtitles")),
+         "qa_results": {k: bool(c.get("pass")) for k, c in (q.get("checks") or {}).items() if isinstance(c, dict) and SEGMENT.fullmatch(str(k))},
+         "qa_status": q.get("status"), "FINAL_READY": ready}
+    path = os.path.join(os.path.dirname(os.path.abspath(report_path)), f"{stem}-FINAL-MANIFEST.json")
+    with open(path, "w") as out:
+        json.dump(m, out, ensure_ascii=False, indent=1)
+    with open(path, "rb") as fh:
+        return upload(fh, f"{folder}/MANIFEST/{stem}-FINAL-MANIFEST.json") is not None
 
 
 def cmd_logs(folder, run_name):
@@ -733,7 +811,7 @@ def boundary_checks(stage, check):
         quiet &= len(JOURNAL) == before
     check("I-unauthorized-requests-refused", lambda: all(refused))
     check("J-refused-before-any-http", lambda: quiet)
-    check("K-journal-scoped-only", lambda: all(scoped and kind in ("list", "get", "create", "update", "delete", "upload-init",
+    check("K-journal-scoped-only", lambda: all(scoped and kind in ("about", "list", "get", "create", "update", "delete", "upload-init",
                                                                    "upload-update", "upload-session") for _, kind, scoped in JOURNAL))
 
 
@@ -765,7 +843,7 @@ def cmd_selftest(run_name):
         m = get_meta(fid, "id,mimeType,trashed")
         return bool(m) and m["mimeType"] == FOLDER and not m.get("trashed")
 
-    if not check("A-auth", lambda: AUTH.get()):
+    if not check("A-auth-and-expected-account", lambda: AUTH.get()):
         sys.exit(1)
     check("B-source-root-folder", lambda: is_folder(STUDIO))
     check("C-final-root-and-videos", lambda: is_folder(FINAL) and all(video_folder(f"V00{i}") for i in range(1, 7)))
@@ -796,7 +874,8 @@ def cmd_selftest(run_name):
         for k in ("studio", "final"):
             with open(os.path.join(stage, k), "rb") as f:
                 back = f.read()
-            if hashlib.sha256(back).digest() != hashlib.sha256(data).digest() or st[k]["md5Checksum"] != hashlib.md5(data).hexdigest():
+            if (hashlib.sha256(back).digest() != hashlib.sha256(data).digest() or st[k]["md5Checksum"] != hashlib.md5(data).hexdigest()
+                    or st[k].get("sha256Checksum") != hashlib.sha256(data).hexdigest()):
                 return False
         return True
     check("F-sha256-and-md5", compare)
@@ -839,21 +918,61 @@ def cmd_selftest_offline():
     check("I0-qa-file-outside-sandbox-not-deletable", lambda: not deletable("offlineQAFile00000001"))
     boundary_checks(stage, check)
     check("offline-no-network-attempted", lambda: not NETWORK)
+    w = lambda rel, scope: write_allowed(rel, scope)
+    check("W-reel-writes-own-outputs", lambda: all(w(f"06_FINAL_EXPORTS/2026/V003_X/{r}", "V5-V003-reel") for r in (
+        "REEL/UEMPIRE_V5_V003_REEL_9x16.mp4", "REEL/UEMPIRE_V5_V003_REEL_9x16_1080x1920.mp4", "QA/UEMPIRE_V5_V003_REEL_9x16-QA.json",
+        "MANIFEST/UEMPIRE_V5_V003_REEL_9x16-FINAL-MANIFEST.json", "THUMBNAILS/UEMPIRE_V5_V003_REEL_9x16.jpg")))
+    check("W-reel-cannot-touch-master-or-other-video", lambda: not any(w(rel, "V5-V003-reel") for rel in (
+        "06_FINAL_EXPORTS/2026/V003_X/MASTER/UEMPIRE_V5_V003_MASTER_4K.mp4", "06_FINAL_EXPORTS/2026/V003_X/REEL/UEMPIRE_V5_V003_MASTER_4K.mp4",
+        "06_FINAL_EXPORTS/2026/V003_X/QA/UEMPIRE_V5_V003_MASTER_4K-QA.json", "06_FINAL_EXPORTS/2026/V001_X/REEL/UEMPIRE_V5_V001_REEL_9x16.mp4",
+        "01_PROJECT_CONTROL/render-ledger/V5-V003-master.jsonl", "01_PROJECT_CONTROL/render-ledger/V5-V003-reel.final.json")))
+    check("W-traversal-and-absolute-paths-invalid", lambda: not any(valid_path(r) for r in (
+        "06_FINAL_EXPORTS/2026/V003_X/REEL/../MASTER/x_REEL_.mp4", "/06_FINAL_EXPORTS/x", "a//b", "./a", "a/ b")))
+
+    def about(email):                             # a canned Drive 'about' answer; any other URL is a tripwire
+        def answer(method, url, body=None, headers=None, timeout=300):
+            if not url.startswith(ABOUT_API + "?"):
+                return tripwire()
+            return io.BytesIO(json.dumps({"user": {"emailAddress": email}}).encode())
+        return answer
+    os.environ.update(DRIVE_ACCOUNT_EMAIL="owner@example.com")
+    def account(email):
+        global _req
+        _req = about(email)
+        try:
+            Auth._account("offline-token-" + "x" * 20)
+            return True
+        except SystemExit:
+            return False
+        finally:
+            _req = tripwire
+    check("A0-expected-account-accepted", lambda: account("Owner@Example.com"))
+    check("A0-other-account-refused", lambda: not account("someone.else@example.com"))
+    check("A0-empty-account-refused", lambda: not account(""))
+    check("offline-no-network-attempted-after-account-tests", lambda: not NETWORK)
     shutil.rmtree(stage, ignore_errors=True)
     sys.exit(0 if all(results) else 1)
+
+
+def cmd_revoke():
+    """End of production: revoke the grant, then prove the credential no longer works. Console: '<check> PASS|FAIL' only."""
+    revoked, refused = AUTH.revoke()
+    print(f"revoke {'PASS' if revoked else 'FAIL'}", flush=True)
+    print(f"post-revoke-auth-refused {'PASS' if refused else 'FAIL'}", flush=True)
+    sys.exit(0 if revoked and refused else 1)
 
 
 NETWORK = []
 COMMANDS = {"bundle": (cmd_bundle, 1), "pull": (cmd_pull, -3), "pull-spec": (cmd_pull_spec, 3), "fetch": (cmd_fetch, 2),
             "push": (cmd_push, 4), "finalize": (cmd_finalize, 5), "logs": (cmd_logs, 2), "selftest": (cmd_selftest, 1),
-            "selftest-offline": (cmd_selftest_offline, 0)}
+            "selftest-offline": (cmd_selftest_offline, 0), "revoke": (cmd_revoke, 0)}
 
 if __name__ == "__main__":
     fn, n = COMMANDS.get(sys.argv[1] if len(sys.argv) > 1 else "", (None, 0))
     args = sys.argv[2:]
     if fn is None or (len(args) != n if n >= 0 else len(args) < -n):
         die("usage: see the module docstring")
-    if fn not in (cmd_fetch, cmd_selftest_offline):
+    if fn not in (cmd_fetch, cmd_selftest_offline, cmd_revoke):
         seed(env("DRIVE_STUDIO_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}"), env("DRIVE_FINAL_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}"))
         if STUDIO == FINAL:
             die("studio and final folders must differ")
