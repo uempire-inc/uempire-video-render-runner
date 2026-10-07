@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Authenticated host tool of the render runner (stdlib only). It is the ONLY code that holds a Google credential.
 
-Auth: OAuth refresh token of a dedicated low-privilege renderer account -> short-lived access token (kept in memory
-only, re-exchanged on expiry or HTTP 401, then the operation is retried once). Scope: the TWO folders the owner shared
-with the renderer as Editor: the studio folder $DRIVE_STUDIO_FOLDER_ID and the final output root $DRIVE_FINAL_FOLDER_ID.
-06_FINAL_EXPORTS/2026/<V00X_*>/{MASTER,REEL,QA,SUBTITLES,THUMBNAILS,MANIFEST} maps to <final>/<V00X_*>/<SUB>; every other
-path lives in the studio folder. Paths are resolved parent -> child by name from their root (never a global name
-search), and every file is proven to descend from its own root (parents walked up) before it is read, written, renamed,
-moved or deleted. Deletes happen only inside the two self-test sandboxes.
+Auth: OAuth refresh token of the OWNER's account (a dedicated OAuth client) -> short-lived access token (kept in memory
+only, re-exchanged on expiry or HTTP 401, then the operation is retried once). Google would let that token reach the
+owner's whole Drive, so THIS code enforces the boundary: exactly two roots, both from variables, the source/studio
+folder $DRIVE_STUDIO_FOLDER_ID and the final output root $DRIVE_FINAL_FOLDER_ID. Nothing else, ever.
+- Top-down provenance: KNOWN = {id: root} is seeded with the two roots; an id enters it only as a child returned by a
+  scoped children() query of a KNOWN parent, or as the result of a create/upload under a KNOWN parent. Parents are never
+  requested or walked upwards.
+- Single choke point: api() -> guard() refuses, BEFORE any HTTP call, any files.list whose q is not
+  "'<KNOWN id>' in parents and trashed = false" (+ an optional exact-name clause), any /files/<id> whose id is not KNOWN, any create,
+  upload or move under an unknown parent, and any parameter outside a small allowlist (no account-wide or drive-wide search parameter).
+  Every passing call is appended to an in-memory journal (never printed) that the selftest asserts on.
+- 06_FINAL_EXPORTS/2026/<V00X_*>/{MASTER,REEL,QA,SUBTITLES,THUMBNAILS,MANIFEST} maps to <final>/<V00X_*>/<SUB>; every
+  other path lives in the studio folder; each prefix only ever goes to its own root.
+- Deletes: only ids whose recorded top-down path runs through <studio>/01_PROJECT_CONTROL/_selftest/ or
+  <final>/V003_*/QA/_selftest-<run>/.
 
   drive.py bundle <out>                                download $DRIVE_BUNDLE_PATH, verify $DRIVE_BUNDLE_SHA256
   drive.py pull <stage> <manifest> <path>...           required Drive files -> staging tree
@@ -16,14 +24,15 @@ moved or deleted. Deletes happen only inside the two self-test sandboxes.
   drive.py push <stage> <manifest> <scope> <report>    upload NEW/CHANGED allowlisted files, verify md5 + size
   drive.py finalize <stage> <result.json> <deliverable> <start> <report>   FINAL ledger record (exit 1 unless ready)
   drive.py logs <dir> <run-name>                       upload the private logs
-  drive.py selftest <run-name>                         boundary self-test (PASS/FAIL line per check, counts only)
+  drive.py selftest <run-name>                         boundary self-test A-K ('<check> PASS|FAIL' only)
+  drive.py selftest-offline                            checks I-K with no credential and no network (tripwire)
 
 Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, DRIVE_STUDIO_FOLDER_ID, DRIVE_FINAL_FOLDER_ID
 (+ DRIVE_BUNDLE_PATH, DRIVE_BUNDLE_SHA256 for bundle). Output: no credential, URL, file id, file name or configuration
 value is ever printed; progress goes to stderr (private log). Container outputs (spec, result, staged files) are
 untrusted data: validated, never executed, symlinks never followed.
 """
-import datetime, fnmatch, hashlib, hmac, json, os, re, secrets, stat, sys, time, urllib.error, urllib.parse, urllib.request
+import contextlib, datetime, fnmatch, hashlib, hmac, io, json, os, re, secrets, shutil, stat, sys, time, urllib.error, urllib.parse, urllib.request
 
 DRIVE_API = "https://www.googleapis.com/drive/v3/files"
 UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files"
@@ -140,8 +149,48 @@ class Auth:
 AUTH = Auth()
 
 
+JOURNAL = []                         # in-memory call journal (never printed): (method, kind, scoped_or_known)
+LIST_Q = re.compile(r"'([A-Za-z0-9_-]{1,128})' in parents and trashed = false(?: and name = '(?:[^'\\]|\\.)*')?")
+PARAMS_OK = {"q", "pageSize", "pageToken", "fields", "alt", "uploadType", "addParents", "removeParents"}
+
+
+def guard(method, url, params, body):
+    """THE choke point: refuse, BEFORE any HTTP call, every request that is not provably scoped to a KNOWN item.
+    Returns the journal kind. Lists must be '<KNOWN id>' in parents; every /files/<id> must be KNOWN; creates,
+    uploads and moves must target KNOWN parents. No corpora / spaces / drive-wide or account-wide parameter exists."""
+    if set(params) - PARAMS_OK:
+        die("refused: request parameter outside the allowlist")
+    for k in ("addParents", "removeParents"):
+        if k in params and params[k] not in KNOWN:
+            die("refused: move to or from an unknown folder")
+    def parents_known():
+        try:
+            meta = json.loads(body or b"{}")
+        except ValueError:
+            die("refused: malformed metadata")
+        ps = meta.get("parents")
+        if not (isinstance(ps, list) and len(ps) == 1 and ps[0] in KNOWN):
+            die("refused: create under an unknown parent")
+    if url == DRIVE_API and method == "GET":
+        m = LIST_Q.fullmatch(params.get("q", ""))
+        if not m or m.group(1) not in KNOWN:
+            die("refused: list not scoped to a known parent")
+        return "list"
+    if url in (DRIVE_API, UPLOAD_API) and method == "POST":
+        parents_known()
+        return "create" if url == DRIVE_API else "upload-init"
+    for base, kinds in ((DRIVE_API + "/", {"GET": "get", "PATCH": "update", "DELETE": "delete"}), (UPLOAD_API + "/", {"PATCH": "upload-update"})):
+        if url.startswith(base) and method in kinds:
+            if url[len(base):] not in KNOWN:
+                die("refused: request on an id that was not reached top-down")
+            return kinds[method]
+    die("refused: endpoint outside the allowlist")
+
+
 def api(method, url, params=None, body=None, headers=None, ok=(200,), what="request"):
-    """Authenticated call. 401 -> re-exchange once and retry; 429/5xx -> bounded backoff. Never logs the URL."""
+    """Authenticated call through guard(). 401 -> re-exchange once and retry; 429/5xx -> bounded backoff. Never logs the URL."""
+    kind = guard(method, url, dict(params or {}), body)
+    JOURNAL.append((method, kind, True))
     params = dict(params or {}, supportsAllDrives="true")
     full = url + "?" + urllib.parse.urlencode(params)
     renewed = False
@@ -169,57 +218,47 @@ def api(method, url, params=None, body=None, headers=None, ok=(200,), what="requ
     die(f"{what}: gave up")
 
 
-# ---------------------------------------------------------------- folder scope: two roots, each prefix to its own root
+# ---------------------------------------------------------------- top-down provenance: two roots, nothing else, ever
 STUDIO = None                        # DRIVE_STUDIO_FOLDER_ID (working tree, ledger, logs, audio, QA-fail, _selftest)
 FINAL = None                         # DRIVE_FINAL_FOLDER_ID  (<V00X_*>/{MASTER,REEL,QA,SUBTITLES,THUMBNAILS,MANIFEST})
 FINAL_SUBS = ("MASTER", "REEL", "QA", "SUBTITLES", "THUMBNAILS", "MANIFEST")
 FINAL_ROUTE = re.compile(r"06_FINAL_EXPORTS/2026/(V\d{3})_[^/]+/(MASTER|REEL|QA|SUBTITLES|THUMBNAILS|MANIFEST)(?:/(.+))?")
 SELFTEST_DIR = re.compile(r"_selftest-[A-Za-z0-9-]{1,80}")   # disposable folder under <final>/V003_*/QA only
-FIELDS = "id,name,mimeType,md5Checksum,size,parents,modifiedTime,trashed,webViewLink"
-META, ROOT_OF = {}, {}               # id -> {id,name,parents} as observed; id -> root id or None (cache)
+FIELDS = "id,name,mimeType,md5Checksum,size,modifiedTime,trashed,webViewLink"
+KNOWN, VIA = {}, {}                  # id -> root id; id -> names from that root (the top-down path that reached it)
 
 
-def get_meta(file_id, fields=FIELDS):
-    """Metadata or None (404/403 = absent or not visible to the renderer)."""
-    r = api("GET", f"{DRIVE_API}/{file_id}", {"fields": fields}, ok=(200, 403, 404), what="metadata")
-    if (r.code if isinstance(r, urllib.error.HTTPError) else r.status) != 200:
-        r.close(); return None
-    meta = _json(r)
-    META[meta["id"]] = {**META.get(meta["id"], {}), **meta}
-    return meta
+def seed(studio, final):
+    global STUDIO, FINAL
+    STUDIO, FINAL = studio, final
+    KNOWN.clear(); VIA.clear()
+    KNOWN.update({studio: studio, final: final}); VIA.update({studio: (), final: ()})
 
 
-def ancestry(file_id):
-    """[file, parent, ..., root] proven by walking `parents` up; None when no root is reached."""
-    chain, cur = [], file_id
-    for _ in range(64):
-        m = META.get(cur) if cur in META and "parents" in META[cur] and "name" in META[cur] else get_meta(cur, "id,name,parents")
-        if cur in (STUDIO, FINAL):
-            return chain + [m or {"id": cur, "name": "", "parents": []}]
-        if not m or not m.get("parents"):
-            return None
-        chain.append(m)
-        cur = m["parents"][0]
-    return None
-
-
-def root_of(file_id):
-    if file_id not in ROOT_OF:
-        a = ancestry(file_id)
-        ROOT_OF[file_id] = a[-1]["id"] if a else None
-    return ROOT_OF[file_id]
+def register(child_id, parent_id, name):
+    """An id becomes KNOWN only as the child of a KNOWN parent (scoped list result, or a create/upload under it)."""
+    if parent_id not in KNOWN:
+        die("refused: parent was not reached top-down")
+    KNOWN[child_id], VIA[child_id] = KNOWN[parent_id], VIA[parent_id] + (name,)
 
 
 def need_in(file_id, root=None):
-    """Refuse any target that is not the given root (or, with root=None, either root) or one of its descendants."""
-    r = root_of(file_id)
-    if r is None or (root is not None and r != root):
-        die("target outside its allowed root folder")
+    """KNOWN check (no HTTP): the id was reached top-down from the given root (root=None: from either root)."""
+    if file_id not in KNOWN or (root is not None and KNOWN[file_id] != root):
+        die("refused: id not reached top-down from its allowed root")
     return file_id
 
 
+def get_meta(file_id, fields=FIELDS, ok=(200,)):
+    """Metadata of a KNOWN id (dies without any HTTP call otherwise); None on an allowed 404."""
+    r = api("GET", f"{DRIVE_API}/{need_in(file_id)}", {"fields": fields}, ok=ok, what="metadata")
+    if (r.code if isinstance(r, urllib.error.HTTPError) else r.status) != 200:
+        r.close(); return None
+    return _json(r)
+
+
 def children(folder_id, name=None):
-    """Children of ONE folder (parent-scoped query, never a global search); duplicate names: the newest wins."""
+    """Children of ONE KNOWN folder (scoped query, never a global search); duplicate names: the newest wins."""
     q = f"'{need_in(folder_id)}' in parents and trashed = false"
     if name is not None:
         q += " and name = '" + name.replace("\\", "\\\\").replace("'", "\\'") + "'"
@@ -229,16 +268,15 @@ def children(folder_id, name=None):
         if token:
             p["pageToken"] = token
         r = _json(api("GET", DRIVE_API, p, what="list"))
-        for f in r.get("files", []):
-            META[f["id"]] = f
-            if folder_id in f.get("parents", []):
-                out.append(f)
+        out += r.get("files", [])
         token = r.get("nextPageToken")
         if not token:
             break
     newest = {}
     for f in sorted(out, key=lambda f: f.get("modifiedTime", "")):
         newest[(f["name"], f["mimeType"] == FOLDER)] = f
+    for f in newest.values():
+        register(f["id"], folder_id, f["name"])
     return list(newest.values())
 
 
@@ -246,8 +284,7 @@ def mkdir(parent, name, root):
     meta = _json(api("POST", DRIVE_API, {"fields": FIELDS}, json.dumps(
         {"name": name, "mimeType": FOLDER, "parents": [need_in(parent, root)]}).encode(),
         {"Content-Type": "application/json"}, what="mkdir"))
-    META[meta["id"]] = meta
-    need_in(meta["id"], root)
+    register(meta["id"], parent, name)
     return meta
 
 
@@ -276,8 +313,8 @@ def lookup(rel, create=False):
         parent = vf["id"]
     meta = None
     for i, part in enumerate(parts):
-        last = i == len(parts) - 1
         hits = children(parent, part)
+        last = i == len(parts) - 1
         folders = [f for f in hits if f["mimeType"] == FOLDER]
         files = [f for f in hits if f["mimeType"] != FOLDER]
         meta = (files or folders)[0] if last and (files or folders) else (folders[0] if folders else None)
@@ -377,7 +414,9 @@ def save_manifest(path, manifest):
 
 # ---------------------------------------------------------------- upload (resumable) + verification
 def upload(src, rel):
-    """Create or replace <rel> (inside the studio folder) from an open local file; return verified metadata or None."""
+    """Create or replace <rel> under its root from an open local file; return verified metadata or None."""
+    if not upload_allowed(need_path(rel)):
+        die("refused: upload outside the allowlisted prefixes")
     size = os.fstat(src.fileno()).st_size
     md5 = digest(src); src.seek(0)
     root = route(rel)[0]
@@ -394,13 +433,14 @@ def upload(src, rel):
         init = api("POST", UPLOAD_API, {"uploadType": "resumable"},
                    json.dumps({"name": name, "parents": [need_in(parent["id"], root)]}).encode(), hdr, what="upload-init")
     session = init.headers.get("Location", ""); init.close()
-    if not session.startswith(UPLOAD_API):
+    if not session.startswith(UPLOAD_API + "?"):
         die("upload session refused")
     pos, result, stalls = 0, None, 0
     while result is None:
         src.seek(pos)
         chunk = src.read(CHUNK)
         rng = f"bytes {pos}-{pos + len(chunk) - 1}/{size}" if chunk else f"bytes */{size}"
+        JOURNAL.append(("PUT", "upload-session", True))
         try:
             r = _req("PUT", session, chunk, {"Content-Range": rng, "Authorization": "Bearer " + AUTH.get()}, timeout=900)
             result = _json(r)
@@ -420,6 +460,7 @@ def upload(src, rel):
             if stalls > 6:
                 die("upload: gave up")
             time.sleep(2 ** stalls)
+            JOURNAL.append(("PUT", "upload-session", True))
             try:
                 _req("PUT", session, b"", {"Content-Range": f"bytes */{size}", "Authorization": "Bearer " + AUTH.get()}).close()
                 break                                      # completed meanwhile; the metadata check below is authoritative
@@ -428,34 +469,40 @@ def upload(src, rel):
                 pos = int(got.rsplit("-", 1)[1]) + 1 if got else 0; e.close()
             except urllib.error.URLError:
                 pass
+    if (result or {}).get("id"):
+        register(result["id"], parent["id"], name)       # created under a KNOWN parent
     fid = (result or {}).get("id") or (lookup(rel) or {}).get("id")
     meta = file_meta(fid) if fid else None
     ok = bool(meta) and meta.get("md5Checksum") == md5 and int(meta.get("size", -1)) == size
     return meta if ok else None
 
 
-def deletable(file_id, studio_selftest, final_qa):
-    """Only a strict descendant of <studio>/01_PROJECT_CONTROL/_selftest, or <final>/V003_*/QA/_selftest-<run>
-    and its content. Proven by walking parents up; the anchors are re-resolved by path, never taken from input."""
-    chain = ancestry(file_id)
-    ids = [m["id"] for m in chain] if chain else []
-    if not chain or file_id in (studio_selftest, final_qa, STUDIO, FINAL):
+def deletable(file_id):
+    """Only an id reached top-down THROUGH <studio>/01_PROJECT_CONTROL/_selftest/ (strictly below it) or through
+    <final>/V003_*/QA/_selftest-<run> (that folder or below). Decided from the recorded path, no HTTP call."""
+    if file_id not in KNOWN or file_id in (STUDIO, FINAL):
         return False
-    if studio_selftest in ids[1:] and ids[-1] == STUDIO:
-        return True
-    if final_qa in ids[1:] and ids[-1] == FINAL:
-        return SELFTEST_DIR.fullmatch(chain[ids.index(final_qa) - 1].get("name", "")) is not None
-    return False
+    root, via = KNOWN[file_id], VIA[file_id]
+    if root == STUDIO:
+        return len(via) >= 3 and via[:2] == tuple(SELFTEST.split("/"))
+    return (root == FINAL and len(via) >= 3 and via[0].startswith("V003_") and via[1] == "QA"
+            and SELFTEST_DIR.fullmatch(via[2]) is not None)
 
 
 def delete_selftest(file_id):
     """Permanent delete, ONLY inside the two self-test sandboxes (see deletable)."""
-    studio_selftest = (lookup(SELFTEST) or {}).get("id")
-    vf = video_folder("V003")
-    final_qa = next((c["id"] for c in children(vf["id"], "QA") if c["mimeType"] == FOLDER), None) if vf else None
-    if not deletable(file_id, studio_selftest, final_qa):
+    if not deletable(file_id):
         die("refused: delete outside the self-test sandboxes")
     api("DELETE", f"{DRIVE_API}/{file_id}", ok=(200, 204), what="delete").close()
+
+
+def upload_allowed(rel):
+    """Generic upload backstop (push additionally binds writes to ONE deliverable)."""
+    any_v = {"v": r"V\d{3}", "k": "(?:MASTER|REEL)", "cid": DELIVERABLE.pattern}
+    return (any(re.fullmatch(p.format(**any_v), rel) for p in WRITE_ALLOW) or bool(PLAN_WRITE.fullmatch(rel))
+            or re.fullmatch(rf"{LOGS_ROOT}/[^/]+/[^/]+", rel) is not None
+            or re.fullmatch(rf"{SELFTEST}/[^/]+/[^/]+", rel) is not None
+            or re.fullmatch(r"06_FINAL_EXPORTS/2026/V003_[^/]+/QA/_selftest-[A-Za-z0-9-]{1,80}/[^/]+", rel) is not None)
 
 
 # ---------------------------------------------------------------- commands
@@ -639,125 +686,175 @@ def cmd_logs(folder, run_name):
         die("a log upload did not verify")
 
 
-def boundary():
-    """(visible, outside): everything the renderer account can see must be a root or descend from one of the two."""
-    items, token = [], None
-    while True:
-        p = {"corpora": "user", "q": "trashed = false", "pageSize": "1000", "fields": "nextPageToken,files(id,name,parents)"}
-        if token:
-            p["pageToken"] = token
-        r = _json(api("GET", DRIVE_API, p, what="list-visible"))
-        for f in r.get("files", []):
-            META[f["id"]] = {**META.get(f["id"], {}), **f}; items.append(f["id"])
-        token = r.get("nextPageToken")
-        if not token:
-            break
-    return len(items), sum(root_of(i) not in (STUDIO, FINAL) for i in items)
+def probes(stage):
+    """Check I: synthetic unauthorized requests. Each must be refused (die) BEFORE any HTTP call (check J)."""
+    rand = secrets.token_urlsafe(25)[:33]
+    return [
+        ("dotdot-path", lambda: lookup("01_PROJECT_CONTROL/../x")),
+        ("absolute-path", lambda: lookup("/etc/passwd")),
+        ("read-outside-prefixes", lambda: cmd_pull(stage, os.path.join(stage, "m.json"), "07_ARCHIVE/x")),
+        ("upload-outside-prefixes", lambda: upload(io.BytesIO(b"x"), "07_ARCHIVE/x.txt")),
+        ("get-unknown-id", lambda: get_meta(rand)),
+        ("download-unknown-id", lambda: download({"id": rand, "mimeType": "text/plain", "md5Checksum": "0", "size": "1"},
+                                                 os.path.join(stage, "dl"))),
+        ("upload-into-unknown-parent", lambda: api("POST", UPLOAD_API, {"uploadType": "resumable"},
+                                                   json.dumps({"name": "x", "parents": [rand]}).encode())),
+        ("update-unknown-id", lambda: api("PATCH", f"{UPLOAD_API}/{rand}", {"uploadType": "resumable"}, b"{}")),
+        ("delete-unknown-id", lambda: delete_selftest(rand)),
+        ("list-unknown-parent", lambda: children(rand)),
+        ("move-to-unknown-parent", lambda: api("PATCH", f"{DRIVE_API}/{STUDIO}", {"addParents": rand}, b"{}")),
+        ("unscoped-list", lambda: api("GET", DRIVE_API, {"q": "trashed = false"})),
+        ("name-only-search", lambda: api("GET", DRIVE_API, {"q": "name = 'x'"})),
+        ("root-alias", lambda: api("GET", DRIVE_API, {"q": "'root' in parents and trashed = false"})),
+        ("shared-with-me", lambda: api("GET", DRIVE_API, {"q": "sharedWithMe = true"})),
+        ("corpora-user", lambda: api("GET", DRIVE_API, {"q": f"'{STUDIO}' in parents and trashed = false", "corpora": "user"})),
+        ("write-outside-deliverable", lambda: write_allowed("06_FINAL_EXPORTS/2026/V001_X/MASTER/V001-X-MASTER-FR.mp4", "V5-V003-reel")
+                                                or die("refused: write outside the deliverable scope")),
+        ("delete-studio-root", lambda: delete_selftest(STUDIO)),
+        ("delete-final-root", lambda: delete_selftest(FINAL)),
+        ("delete-outside-selftest", lambda: delete_selftest(next((i for i in KNOWN if i not in (STUDIO, FINAL) and not deletable(i)), rand))),
+    ]
+
+
+def boundary_checks(stage, check):
+    """Checks I, J, K (shared by the online selftest and selftest-offline)."""
+    refused, quiet = [], True
+    for name, fn in probes(stage):
+        before = len(JOURNAL)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fn()
+            ok = False                            # not refused
+        except SystemExit:
+            ok = len(JOURNAL) == before           # refused by a check, not by a later failure (e.g. no credential)
+        except Exception:
+            ok = False
+        refused.append(ok)
+        quiet &= len(JOURNAL) == before
+    check("I-unauthorized-requests-refused", lambda: all(refused))
+    check("J-refused-before-any-http", lambda: quiet)
+    check("K-journal-scoped-only", lambda: all(scoped and kind in ("list", "get", "create", "update", "delete", "upload-init",
+                                                                   "upload-update", "upload-session") for _, kind, scoped in JOURNAL))
+
+
+def runner(check_results):
+    def check(label, fn):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) if label[0] in "IJK" else contextlib.nullcontext():
+                ok = bool(fn())
+        except SystemExit:
+            ok = False
+        except Exception as e:                    # no traceback: it could quote an id
+            log(f"{label}: {type(e).__name__}"); ok = False
+        print(f"{label} {'PASS' if ok else 'FAIL'}", flush=True)
+        check_results.append(ok)
+        return ok
+    return check
 
 
 def cmd_selftest(run_name):
-    """Host-only proof of the boundary. Console: one PASS/FAIL line per check, counts only."""
+    """Host-only proof of the application boundary (A-K). Console: '<check> PASS|FAIL' only."""
     results, st = [], {}
+    check = runner(results)
     tag = need_path(f"{run_name}-{secrets.token_hex(4)}")
-
-    def check(name, fn):
-        t0 = time.time()
-        try:
-            ok, extra = fn()
-        except SystemExit:
-            ok, extra = False, ""
-        except Exception as e:                    # no traceback: it could quote an id
-            log(f"{name}: {type(e).__name__}"); ok, extra = False, ""
-        print(f"selftest-{name} {'PASS' if ok else 'FAIL'} ({time.time() - t0:.0f}s){extra}", flush=True)
-        results.append(ok)
-        return ok
+    stage = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), f"selftest-{secrets.token_hex(4)}")
+    os.makedirs(stage, exist_ok=True)
+    data = f"render runner selftest {now()} {secrets.token_hex(16)}\n".encode()
 
     def is_folder(fid):
         m = get_meta(fid, "id,mimeType,trashed")
-        return bool(m) and m["mimeType"] == FOLDER and not m.get("trashed"), ""
+        return bool(m) and m["mimeType"] == FOLDER and not m.get("trashed")
 
-    def probe(rel):
-        """Upload a generated text file, download it, compare sha256 + Drive md5; return its metadata."""
-        data = f"render runner selftest {now()} {secrets.token_hex(16)}\n".encode()
-        path = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), f"selftest-{secrets.token_hex(4)}.txt")
-        with open(path, "wb") as f:
-            f.write(data)
-        with open(path, "rb") as f:
-            meta = upload(f, rel)
-        os.remove(path)
-        if not meta:
-            return None
-        download(meta, path + ".dl")
-        with open(path + ".dl", "rb") as f:
-            back = f.read()
-        os.remove(path + ".dl")
-        same = hashlib.sha256(back).digest() == hashlib.sha256(data).digest() and meta["md5Checksum"] == hashlib.md5(data).hexdigest()
-        return meta if same else None
-
-    def gone(fid):
-        m = get_meta(fid, "id,trashed")
-        return not m or bool(m.get("trashed"))
-
-    if not check("auth", lambda: (bool(AUTH.get()), "")):
+    if not check("A-auth", lambda: AUTH.get()):
         sys.exit(1)
-    studio_ok, final_ok = check("studio-folder", lambda: is_folder(STUDIO)), check("final-folder", lambda: is_folder(FINAL))
-    if not (studio_ok and final_ok):
-        sys.exit(1)
-    check("final-video-folders", lambda: (all(video_folder(f"V00{i}") for i in range(1, 7)), ""))
+    check("B-source-root-folder", lambda: is_folder(STUDIO))
+    check("C-final-root-and-videos", lambda: is_folder(FINAL) and all(video_folder(f"V00{i}") for i in range(1, 7)))
 
-    def studio_roundtrip():
-        sel = lookup(SELFTEST, create=True)
-        st["a"], st["b"] = mkdir(sel["id"], tag + "-a", STUDIO)["id"], mkdir(sel["id"], tag + "-b", STUDIO)["id"]
-        meta = probe(f"{SELFTEST}/{tag}-a/probe.txt")
-        if not meta:
-            return False, " (upload/download)"
-        st["f"] = meta["id"]
-        r = _json(api("PATCH", f"{DRIVE_API}/{need_in(st['f'], STUDIO)}", {"fields": "id,name"},
-                      json.dumps({"name": "probe-renamed.txt"}).encode(), {"Content-Type": "application/json"}, what="rename"))
-        if r.get("name") != "probe-renamed.txt":
-            return False, " (rename)"
-        r = _json(api("PATCH", f"{DRIVE_API}/{need_in(st['f'], STUDIO)}", {"addParents": need_in(st["b"], STUDIO),
-                      "removeParents": st["a"], "fields": "id,parents"}, b"{}", {"Content-Type": "application/json"}, what="move"))
-        META.pop(st["f"], None); ROOT_OF.pop(st["f"], None)
-        return r.get("parents") == [st["b"]], "" if r.get("parents") == [st["b"]] else " (move)"
-    check("studio-roundtrip", studio_roundtrip)
-
-    def studio_delete():
-        for k in ("a", "b"):
-            if k in st:
-                delete_selftest(st[k])
-        return {"a", "b"} <= set(st) and all(gone(st[k]) for k in ("a", "b", "f") if k in st), ""
-    check("studio-delete", studio_delete)
-
-    def final_roundtrip():
+    def create():
         vf = video_folder("V003")
-        meta = probe(f"06_FINAL_EXPORTS/2026/{vf['name']}/QA/_selftest-{tag}/probe.txt") if vf else None
-        if not meta:
-            return False, " (upload/download)"
-        st["ff"], st["fd"] = meta["id"], meta["parents"][0]
-        delete_selftest(st["ff"])
-        delete_selftest(st["fd"])
-        return gone(st["ff"]) and gone(st["fd"]), ""
-    check("final-create-delete", final_roundtrip)
+        st["paths"] = {"studio": f"{SELFTEST}/{tag}/probe.txt", "final": f"06_FINAL_EXPORTS/2026/{vf['name']}/QA/_selftest-{tag}/probe.txt"}
+        p = os.path.join(stage, "probe.txt")
+        with open(p, "wb") as f:
+            f.write(data)
+        for k, rel in st["paths"].items():
+            with open(p, "rb") as f:
+                meta = upload(f, rel)
+            if not meta:
+                return False
+            st[k] = meta
+            st[k + "-dir"] = lookup(rel.rsplit("/", 1)[0])["id"]
+        return True
+    check("D-create-probe-files", create)
 
-    def visible():
-        n, outside = boundary()
-        return outside == 0, f" visible items: {n}, outside studio/final: {outside}"
-    check("boundary", visible)
+    def read_back():
+        for k in ("studio", "final"):
+            download(st[k], os.path.join(stage, k))
+        return True
+    check("E-read-back", read_back)
+
+    def compare():
+        for k in ("studio", "final"):
+            with open(os.path.join(stage, k), "rb") as f:
+                back = f.read()
+            if hashlib.sha256(back).digest() != hashlib.sha256(data).digest() or st[k]["md5Checksum"] != hashlib.md5(data).hexdigest():
+                return False
+        return True
+    check("F-sha256-and-md5", compare)
+
+    def delete():
+        for k in ("studio", "final", "studio-dir", "final-dir"):
+            delete_selftest(st[k]["id"] if isinstance(st[k], dict) else st[k])
+        return True
+    check("G-delete-files-then-run-folders", delete)
+
+    def gone():
+        ids = [st[k]["id"] if isinstance(st[k], dict) else st[k] for k in ("studio", "final", "studio-dir", "final-dir")]
+        return all((lambda m: m is None or m.get("trashed"))(get_meta(i, "id,trashed", ok=(200, 404))) for i in ids)
+    check("H-deletion-confirmed", gone)
+
+    boundary_checks(stage, check)
+    shutil.rmtree(stage, ignore_errors=True)
     sys.exit(0 if all(results) else 1)
 
 
+def cmd_selftest_offline():
+    """Checks I, J, K with no credential and no network: every HTTP attempt is a tripwire."""
+    global _req
+    def tripwire(*a, **k):
+        NETWORK.append(1)
+        raise urllib.error.URLError("offline")
+    _req = tripwire
+    seed("offlineStudioRoot0000", "offlineFinalRoot00000")
+    register("offlineV003Folder0001", FINAL, "V003_EXAMPLE")          # a synthetic top-down tree (no HTTP)
+    register("offlineV003QAFolder01", "offlineV003Folder0001", "QA")
+    register("offlineQAFile00000001", "offlineV003QAFolder01", "V003-EXAMPLE-REEL-9x16-FR-QA.json")
+    register("offlineCtrlFolder0001", STUDIO, "01_PROJECT_CONTROL")
+    register("offlineLedgerFolder01", "offlineCtrlFolder0001", "render-ledger")
+    register("offlineLedgerFile0001", "offlineLedgerFolder01", "V5-V003-reel.final.json")
+    results = []
+    check = runner(results)
+    stage = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"selftest-offline-{secrets.token_hex(4)}")
+    os.makedirs(stage, exist_ok=True)
+    check("offline-no-credentials-loaded", lambda: AUTH.token is None)
+    check("I0-qa-file-outside-sandbox-not-deletable", lambda: not deletable("offlineQAFile00000001"))
+    boundary_checks(stage, check)
+    check("offline-no-network-attempted", lambda: not NETWORK)
+    shutil.rmtree(stage, ignore_errors=True)
+    sys.exit(0 if all(results) else 1)
+
+
+NETWORK = []
 COMMANDS = {"bundle": (cmd_bundle, 1), "pull": (cmd_pull, -3), "pull-spec": (cmd_pull_spec, 3), "fetch": (cmd_fetch, 2),
-            "push": (cmd_push, 4), "finalize": (cmd_finalize, 5), "logs": (cmd_logs, 2), "selftest": (cmd_selftest, 1)}
+            "push": (cmd_push, 4), "finalize": (cmd_finalize, 5), "logs": (cmd_logs, 2), "selftest": (cmd_selftest, 1),
+            "selftest-offline": (cmd_selftest_offline, 0)}
 
 if __name__ == "__main__":
     fn, n = COMMANDS.get(sys.argv[1] if len(sys.argv) > 1 else "", (None, 0))
     args = sys.argv[2:]
     if fn is None or (len(args) != n if n >= 0 else len(args) < -n):
         die("usage: see the module docstring")
-    if fn is not cmd_fetch:
-        STUDIO = env("DRIVE_STUDIO_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}")
-        FINAL = env("DRIVE_FINAL_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}")
+    if fn not in (cmd_fetch, cmd_selftest_offline):
+        seed(env("DRIVE_STUDIO_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}"), env("DRIVE_FINAL_FOLDER_ID", r"[A-Za-z0-9_-]{10,100}"))
         if STUDIO == FINAL:
             die("studio and final folders must differ")
     try:

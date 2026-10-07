@@ -184,7 +184,7 @@ import ast, re, sys
 src = open(sys.argv[1]).read(); tree = ast.parse(src)
 bad = []
 def chk(cond, msg): print(("PASS  " if cond else "FAIL  ") + msg); cond or bad.append(msg)
-STDLIB = {"datetime", "fnmatch", "hashlib", "hmac", "json", "os", "re", "secrets", "stat", "sys", "time", "urllib", "urllib.error", "urllib.parse", "urllib.request"}
+STDLIB = {"contextlib", "datetime", "fnmatch", "hashlib", "hmac", "io", "json", "os", "re", "secrets", "shutil", "stat", "sys", "time", "urllib", "urllib.error", "urllib.parse", "urllib.request"}
 mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names} | {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
 chk(mods <= STDLIB, "drive.py imports the standard library only")
 chk(not re.search(r"subprocess|\beval\(|\bexec\(|pickle|os\.system|os\.popen", src), "drive.py never executes anything")
@@ -205,14 +205,46 @@ chk(not re.search(r"\bopen\(|\.write\(|\bprint\(|\blog\(|json\.dump|environ\[|se
     "credentials stay inside Auth: never written, logged or exported; only the access token leaves it, in memory")
 # scope: parent-scoped resolution from the studio folder, no global search
 NAMEQ = re.compile(r"""name\s*(=|!=|contains)\s*\\?'|fullText""")
-chk({f for f, n in fns.items() if NAMEQ.search(ast.get_source_segment(src, n))} == {"children"} and not NAMEQ.search(re.sub(r"(?s)\ndef .*", "", src.split("\ndef ", 1)[0]))
+chk({f for f, n in fns.items() if NAMEQ.search(ast.get_source_segment(src, n))} == {"children", "probes"} and "name-only-search" in seg("probes") and not NAMEQ.search(re.sub(r"(?s)\ndef .*", "", src.split("\ndef ", 1)[0]))
     and re.search(r"""q = f"'\{need_in\(folder_id\)\}' in parents and trashed = false\"""", seg("children")) is not None,
     "name queries only inside children(), always '<parent>' in parents (no global name search)")
-chk(not re.search(r"allDrives|corpora\W+(domain|drive)|\bspaces\b|sharedWithMe|/drive/v2", src.replace("supportsAllDrives", "")),
-    "no corpora=allDrives/domain/drive, no sharedWithMe/spaces/v2")
-chk({f for f, n in fns.items() if "corpora" in ast.get_source_segment(src, n)} <= {"boundary"} and '"corpora": "user", "q": "trashed = false"' in seg("boundary")
-    and callers("boundary") == {"cmd_selftest"}, "the only account-wide listing is the selftest boundary count (corpora=user, trashed=false)")
-chk('STUDIO = env("DRIVE_STUDIO_FOLDER_ID"' in src and 'FINAL = env("DRIVE_FINAL_FOLDER_ID"' in src, "both roots come from repository variables (no hardcoded folder id)")
+# global operations: corpora / sharedWithMe / 'root' / spaces exist ONLY as refused probes of the selftest
+no_probes = src.replace(seg("probes"), "")
+chk(not re.search(r"corpora|allDrives|sharedWithMe|'root'|\bspaces\b|/drive/v2|includeItemsFromAllDrives|driveId", no_probes.replace("supportsAllDrives", "").replace(ast.get_docstring(fns["guard"], clean=False) or "", "")),
+    "no corpora, sharedWithMe, 'root', spaces or drive-wide parameter outside the refused selftest probes")
+chk("seed(env(\"DRIVE_STUDIO_FOLDER_ID\"" in src and "env(\"DRIVE_FINAL_FOLDER_ID\"" in src and not re.search(r'(STUDIO|FINAL) = "', src),
+    "both roots come from repository variables (no hardcoded folder id)")
+# single choke point: guard() runs inside api() before any HTTP; lists must be '<KNOWN id>' in parents
+api_src, guard_src = seg("api"), seg("guard")
+before = lambda text, a, b: a in text and b in text and text.index(a) < text.index(b)
+chk(bool(guard_src) and before(api_src, "    kind = guard(method, url, dict(params or {}), body)\n", "_req(") and before(api_src, "JOURNAL.append", "_req(")
+    and "m.group(1) not in KNOWN" in guard_src and "not in KNOWN" in guard_src.split("for base, kinds")[1] and "parents_known()" in guard_src
+    and 'LIST_Q = re.compile(r"\'([A-Za-z0-9_-]{1,128})\' in parents and trashed = false' in src,
+    "api() choke point: guard() refuses unscoped lists, unknown ids and unknown parents before any HTTP call")
+pok = re.search(r"PARAMS_OK = \{([^}]*)\}", src)
+chk(bool(pok) and set(re.findall(r'"(\w+)"', pok.group(1))) == {"q", "pageSize", "pageToken", "fields", "alt", "uploadType", "addParents", "removeParents"},
+    "request parameters allowlisted (no corpora / spaces / driveId / includeItemsFromAllDrives)")
+lists = [c for c in ast.walk(tree) if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "api" and len(c.args) > 1
+         and ast.get_source_segment(src, c.args[0]) == '"GET"' and ast.get_source_segment(src, c.args[1]) == "DRIVE_API"]
+outside_probes = [c for c in lists if not (seg("probes") and ast.get_source_segment(src, c) in seg("probes"))]
+chk(len(outside_probes) == 1 and ast.get_source_segment(src, outside_probes[0]) in seg("children"), "the only files.list call is children() (scoped)")
+# top-down provenance: no upward walk, KNOWN only grows from KNOWN parents
+loops = [n for n in ast.walk(tree) if isinstance(n, (ast.For, ast.While, ast.ListComp, ast.GeneratorExp))]
+meta_in_loop = [n for n in loops if any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "get_meta" for c in ast.walk(n))
+                and "parents" in ast.get_source_segment(src, n)]
+chk(not {"ancestry", "root_of"} & set(fns) and "parents" not in re.search(r'FIELDS = "([^"]*)"', src).group(1)
+    and not re.search(r'fields["\s:=,]+[^)\n]*parents', src) and not meta_in_loop
+    and not re.search(r'(\.get\("parents"\)|\["parents"\])', src.replace(guard_src, "")),
+    "no upward parents walk: parents are never requested nor read (except the request-body check in guard)")
+writes = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AugAssign)) for t in getattr(n, "targets", [getattr(n, "target", None)])
+          if isinstance(t, ast.Subscript) and getattr(t.value, "id", "") in ("KNOWN", "VIA")]
+chk(all(ast.get_source_segment(src, w) in seg("register") for w in writes) and "if parent_id not in KNOWN" in seg("register")
+    and "KNOWN.update({studio: studio, final: final})" in seg("seed") and callers("seed") <= set() | {"cmd_selftest_offline"} if False else
+    all(ast.get_source_segment(src, w) in seg("register") for w in writes) and "if parent_id not in KNOWN" in seg("register")
+    and "KNOWN.update({studio: studio, final: final})" in seg("seed"),
+    "an id becomes KNOWN only as a child of a KNOWN parent (seeded with the two roots)")
+chk('api("GET", f"{DRIVE_API}/{need_in(file_id)}"' in seg("get_meta") and "need_in(" in seg("children").split("api(")[0],
+    "get_meta / children of an unknown id die before any HTTP call")
 chk("root, video, parts = route(rel)" in seg("lookup") and "parent = root" in seg("lookup") and "return FINAL, " in seg("route") and "return STUDIO, " in seg("route"),
     "paths resolve parent -> child from their own root (final exports -> final root, the rest -> studio)")
 r6 = re.search(r'FINAL_SUBS = \(([^)]*)\)', src); rt = re.search(r'FINAL_ROUTE = re.compile\(r"06_FINAL_EXPORTS/2026/\(V\\d\{3\}\)_\[\^/\]\+/\(([A-Z|]+)\)', src)
@@ -223,24 +255,32 @@ chk(re.search(r'\n( +)if root == FINAL and not \(\(i == 0 and part in FINAL_SUBS
     "final root: video folders never created, only allowlisted SUB folders (+ the QA self-test sandbox)")
 for f in ("children", "download", "upload", "file_meta", "mkdir"):
     chk("need_in(" in seg(f), f"{f}() proves the target descends from its allowed root")
-chk("parents" in seg("ancestry") and "root_of(" in seg("need_in") and "upload(" in seg("cmd_push") and "need_in(parent[\"id\"], root)" in seg("upload"),
-    "ancestry walks parents up; each prefix may only be written to its own root")
+chk("KNOWN[file_id] != root" in seg("need_in") and "need_in(parent[\"id\"], root)" in seg("upload")
+    and before(seg("upload"), "if not upload_allowed(need_path(rel)):", "os.fstat"), "each prefix written only to its own root; uploads allowlisted before any work")
 # deletes: _selftest only
 dels = {f for f, n in fns.items() if re.search(r'"DELETE"|\.delete\(|"trashed": *[Tt]rue', ast.get_source_segment(src, n))}
-chk(dels == {"delete_selftest"} and callers("delete_selftest") == {"cmd_selftest"}, "delete exists only in delete_selftest(), called only by the selftest")
+chk(dels == {"delete_selftest", "guard"} and seg("guard").count("DELETE") == 1 and '"DELETE": "delete"' in seg("guard")
+    and callers("delete_selftest") <= {"cmd_selftest", "probes"}, "delete exists only in delete_selftest(), called only by the selftest")
 d = seg("delete_selftest")
 g = seg("deletable")
 chk("deletable(" in d and d.index("deletable(") < d.index('"DELETE"') and d.index("die(") < d.index('"DELETE"')
-    and "lookup(SELFTEST)" in d and 'video_folder("V003")' in d and 'children(vf["id"], "QA")' in d
-    and 'SELFTEST = "01_PROJECT_CONTROL/_selftest"' in src and "studio_selftest in ids[1:]" in g and "final_qa in ids[1:]" in g and "SELFTEST_DIR.fullmatch" in g
-    and 'SELFTEST_DIR = re.compile(r"_selftest-' in src, "delete guarded: only under studio 01_PROJECT_CONTROL/_selftest or final V003_*/QA/_selftest-<run>")
+    and "file_id not in KNOWN or file_id in (STUDIO, FINAL)" in g and "via[:2] == tuple(SELFTEST.split(\"/\"))" in g and "len(via) >= 3" in g
+    and 'via[0].startswith("V003_") and via[1] == "QA"' in g and "SELFTEST_DIR.fullmatch(via[2])" in g and "api(" not in g
+    and 'SELFTEST = "01_PROJECT_CONTROL/_selftest"' in src and 'SELFTEST_DIR = re.compile(r"_selftest-' in src,
+    "delete guarded by the recorded top-down path: only <studio>/01_PROJECT_CONTROL/_selftest/** or <final>/V003_*/QA/_selftest-<run>/**")
 # uploads
-chk(callers("upload") == {"cmd_push", "cmd_finalize", "cmd_logs", "cmd_selftest"}, "uploads only from push / finalize / logs / selftest")
+chk(callers("upload") <= {"cmd_push", "cmd_finalize", "cmd_logs", "cmd_selftest", "probes"} and {"cmd_push", "cmd_finalize", "cmd_logs"} <= callers("upload"),
+    "uploads only from push / finalize / logs / selftest")
 push = seg("cmd_push")
 chk("write_allowed(" in push and push.index("write_allowed(") < push.index("upload("), "push checks every destination against the write allowlist before upload")
 chk('upload(f, f"01_PROJECT_CONTROL/render-ledger/{cid}.final.json")' in seg("cmd_finalize") and "LOGS_ROOT" in seg("cmd_logs")
-    and set(re.findall(r'probe\(f"([^{]*\{[A-Z_]*)', seg("cmd_selftest"))) == {"{SELFTEST", "06_FINAL_EXPORTS/2026/{"} and "/QA/_selftest-{tag}/" in seg("cmd_selftest"),
+    and '"studio": f"{SELFTEST}/{tag}/probe.txt"' in seg("cmd_selftest") and '"final": f"06_FINAL_EXPORTS/2026/{vf[\'name\']}/QA/_selftest-{tag}/probe.txt"' in seg("cmd_selftest"),
     "finalize / logs / selftest upload only to ledger / render-logs / the self-test sandboxes")
+st = seg("cmd_selftest") + seg("cmd_selftest_offline") + seg("boundary_checks") + seg("runner")
+chk(not re.search(r"DRIVE_API|UPLOAD_API|_req\(|corpora|trashed = false", st), "the selftest itself makes no direct or unscoped Drive request (only children()/get_meta()/upload()/download()/delete)")
+chk(all(f'check("{c}-' in seg("cmd_selftest") or f'check("{c}-' in seg("boundary_checks") for c in "ABCDEFGH" + "IJK")
+    and "quiet &= len(JOURNAL) == before" in seg("boundary_checks") and "ok = len(JOURNAL) == before" in seg("boundary_checks") and "NETWORK" in seg("cmd_selftest_offline") and "_req = tripwire" in seg("cmd_selftest_offline"),
+    "selftest A-K present; I/J assert refusal before any HTTP; offline mode trips on any network attempt")
 allow = re.search(r"WRITE_ALLOW = \((.*?)\n\)", src, re.S)
 prefixes = sorted(set(re.findall(r'r"([^{(\\"]+)', allow.group(1)))) if allow else []
 chk(prefixes == ["01_PROJECT_CONTROL/render-ledger/", "04_AUDIO/", "05_WORK_IN_PROGRESS/V5_QA_FAIL/", "06_FINAL_EXPORTS/2026/"],
