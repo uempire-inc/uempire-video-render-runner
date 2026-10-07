@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       deliverables:
-        description: "all, or comma-separated deliverable ids"
+        description: "all, comma-separated deliverable ids, or selftest"
         default: V5-V003-reel
         required: true
       job:
@@ -14,17 +14,45 @@ on:
         description: "1 = re-render even if already final"
         default: "0"
 
+# Drive credentials exist only in the env of the host steps that call bootstrap/drive.py. Untrusted code only ever
+# runs in the hardened container (bootstrap/run.sh box), which receives no credential and no GITHUB_* variable.
 permissions:
   contents: read
 
 concurrency: render
 
 jobs:
-  plan:
+  selftest:   # host only, no container: proves what the renderer account can and cannot reach
+    if: inputs.deliverables == 'selftest'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      SELECTION: ${{ inputs.deliverables }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+      - name: Drive boundary self-test (host)
+        env: &gd_s
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
+          DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
+          DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}
+          DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
+        run: bootstrap/run.sh selftest "$SELECTION"
+      - name: Cleanup
+        if: always()
+        env: *gd_s
+        run: bootstrap/run.sh cleanup "$SELECTION"
+
+  plan:
+    if: inputs.deliverables != 'selftest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
+      matrix: ${{ steps.publish.outputs.matrix }}
     env:
       SELECTION: ${{ inputs.deliverables }}
       V5_JOB: ${{ inputs.job }}
@@ -33,25 +61,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
-      - name: Packages
-        run: sudo apt-get update -qq > /dev/null && sudo apt-get install -y -qq rclone > /dev/null
-      - name: Fetch private bundle
-        env: &drive
-          DRIVE_BUNDLE_PATH: ${{ secrets.DRIVE_BUNDLE_PATH }}
+      - name: Fetch bundle and job (host)
+        env: &gd
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
+          DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
+          DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}
           DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
-          RCLONE_CONFIG_GD_TYPE: drive
-          RCLONE_CONFIG_GD_SCOPE: drive
-          RCLONE_CONFIG_GD_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          RCLONE_CONFIG_GD_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          RCLONE_CONFIG_GD_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.GOOGLE_REFRESH_TOKEN }}","expiry":"2000-01-01T00:00:00Z"}'
         run: bootstrap/run.sh fetch "$SELECTION"
-      - name: Plan
-        id: plan
-        env: *drive
+      - name: Build sandbox image (no credentials)
+        run: bootstrap/run.sh image "$SELECTION"
+      - name: Pull ledger (host)
+        env: *gd
+        run: bootstrap/run.sh plan-pull "$SELECTION"
+      - name: Plan (container, network none)
         run: bootstrap/run.sh plan "$SELECTION"
+      - name: Publish plan (host)
+        id: publish
+        env: *gd
+        run: bootstrap/run.sh plan-publish "$SELECTION"
       - name: Cleanup
         if: always()
-        env: *drive
+        env: *gd
         run: bootstrap/run.sh cleanup plan
 
   render:
@@ -72,36 +105,33 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
-        with:
-          node-version: 20
-      - name: Packages
-        run: |
-          sudo apt-get update -qq > /dev/null
-          sudo apt-get install -y -qq ffmpeg rsync fuse3 rclone libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libgbm1 \
-            libxrandr2 libxkbcommon0 libxfixes3 libxcomposite1 libxdamage1 libpango-1.0-0 libcairo2 libcups2 \
-            fonts-noto-color-emoji "$(apt-cache show libasound2t64 > /dev/null 2>&1 && echo libasound2t64 || echo libasound2)" > /dev/null
-      - name: Fetch private bundle
-        env: &drive_r
-          DRIVE_BUNDLE_PATH: ${{ secrets.DRIVE_BUNDLE_PATH }}
+      - name: Fetch bundle and job (host)
+        env: &gd_r
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_STUDIO_FOLDER_ID: ${{ vars.DRIVE_STUDIO_FOLDER_ID }}
+          DRIVE_FINAL_FOLDER_ID: ${{ vars.DRIVE_FINAL_FOLDER_ID }}
+          DRIVE_BUNDLE_PATH: ${{ vars.DRIVE_BUNDLE_PATH }}
           DRIVE_BUNDLE_SHA256: ${{ secrets.DRIVE_BUNDLE_SHA256 }}
-          RCLONE_CONFIG_GD_TYPE: drive
-          RCLONE_CONFIG_GD_SCOPE: drive
-          RCLONE_CONFIG_GD_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          RCLONE_CONFIG_GD_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          RCLONE_CONFIG_GD_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.GOOGLE_REFRESH_TOKEN }}","expiry":"2000-01-01T00:00:00Z"}'
         run: bootstrap/run.sh fetch "$DELIVERABLE"
-      - name: Install dependencies (no secrets)
+      - name: Build sandbox image (no credentials)
+        run: bootstrap/run.sh image "$DELIVERABLE"
+      - name: Install (container, no credentials)
         run: bootstrap/run.sh install "$DELIVERABLE"
-      - name: Mount Drive
-        env: *drive_r
-        run: bootstrap/run.sh mount "$DELIVERABLE"
-      - name: Render (no secrets)
+      - name: Plan inputs (container, network none)
+        run: bootstrap/run.sh inputs "$DELIVERABLE"
+      - name: Pull inputs (host)
+        env: *gd_r
+        run: bootstrap/run.sh pull "$DELIVERABLE"
+      - name: Render (container, network none)
+        id: render
         run: bootstrap/run.sh render "$DELIVERABLE"
-      - name: Verify on Drive
-        env: *drive_r
-        run: bootstrap/run.sh finalize "$DELIVERABLE"
+      - name: Upload and verify (host)
+        if: always() && steps.render.outcome != 'skipped'
+        env: *gd_r
+        run: bootstrap/run.sh upload "$DELIVERABLE"
       - name: Cleanup
         if: always()
-        env: *drive_r
+        env: *gd_r
         run: bootstrap/run.sh cleanup "$DELIVERABLE"
